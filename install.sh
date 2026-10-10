@@ -26,6 +26,11 @@ LOG="${LOG_DIR}/install-$(date +%Y%m%d-%H%M%S).log"
 exec > >(tee -a "$LOG" 2>&1)
 echo "install log: $LOG"
 
+# fail fast on an incomplete checkout: without the kb/ package every downstream
+# step would fail after minutes of downloads instead of now
+[ -f kb/sync.py ] && [ -f kb/search.py ] || \
+  fail_step "this checkout is incomplete — kb/sync.py missing. Re-clone or re-export the pack, then re-run ./install.sh"
+
 # --- step tracking, degraded-items list, temp cleanup, failure trap ----------
 # STEPS is the ordered install pipeline. CURRENT_STEP is the one in flight.
 # COMPLETED accumulates finished steps; DEGRADED accumulates non-fatal
