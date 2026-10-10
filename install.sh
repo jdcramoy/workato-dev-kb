@@ -325,6 +325,17 @@ finish_step index
 
 # --- step: fractal — projection + the AIRTIGHT coverage gate --------------------
 begin_step fractal
+# the fractal layer indexes the consumer's knowledge tree at
+# ~/.claude/knowledge (kb/fractal.py: KT = Path.home()/.claude/knowledge) and
+# crashes without it — seed the scaffold from this repo's knowledge/ if the
+# consumer has none (idempotent: only when INDEX.md is absent)
+KT_HOME="$HOME/.claude/knowledge"
+if [ ! -f "$KT_HOME/INDEX.md" ]; then
+  mkdir -p "$KT_HOME/domains"
+  cp knowledge/INDEX.md "$KT_HOME/INDEX.md"
+  [ -f knowledge/memory-rules.md ] && cp knowledge/memory-rules.md "$KT_HOME/memory-rules.md"
+  echo "  seeded knowledge tree at $KT_HOME (repo knowledge/ scaffold)"
+fi
 with_retry "build fractal projection" 2 python3 -m kb.fractal build
 COV=$(python3 -m kb.fractal coverage 2>&1) || fail_step "fractal coverage audit crashed: $COV"
 echo "$COV" | grep -qi "AIRTIGHT" || degraded "fractal coverage not AIRTIGHT — audit says: $COV"
