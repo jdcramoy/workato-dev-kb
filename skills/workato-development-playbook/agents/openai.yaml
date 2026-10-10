@@ -1,0 +1,4 @@
+interface:
+  display_name: "Workato Development"
+  short_description: "Build, test, repair, and release Workato systems"
+  default_prompt: "Use $workato-development-playbook to carry this Workato change from live inventory through testing, evidence, and promotion-ready handoff."
