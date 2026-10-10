@@ -286,12 +286,15 @@ finish_step config
 # Fetched through python -c (NOT a heredoc: a heredoc feeds with_retry's stdin
 # once, so a retry would re-run python against an exhausted script). The HF
 # cache under $HOME makes retries resumable rather than restarting downloads.
+# STREAMED, not captured: a multi-GB download must show live progress bars —
+# a silent gap here is exactly the friction the installer promises to avoid.
 begin_step models
-with_retry "pre-download bge models (~2GB, resumable)" 3 python3 -c '
+echo "  downloading ~2GB of embedding models — progress bars below, this takes a while:"
+with_retry_stream "pre-download bge models (~2GB, resumable)" 3 python3 -u -c '
 from sentence_transformers import SentenceTransformer
 for m in ("BAAI/bge-base-en-v1.5", "BAAI/bge-reranker-base"):
-    print("fetching", m); SentenceTransformer(m)
-print("models ready")
+    print("fetching", m, flush=True); SentenceTransformer(m)
+print("models ready", flush=True)
 '
 finish_step models
 
