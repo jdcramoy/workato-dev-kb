@@ -1,0 +1,11 @@
+# Personal-name blocklist (one full name per line). Names verified against
+# ~/.claude/knowledge/people/ at execution time (2026-10-10). Josh's chain:
+# Josh -> Sen Rong Poh -> Stephanie Dwight -> Carter Busse -> Vijay Tella.
+# NOTE: Vijay Tummala is a DIFFERENT person (Director, Data Architecture & BI,
+# manager's peer) and is deliberately NOT listed.
+Josh Cramoy
+Joshua Cramoy
+Sen Rong Poh
+Stephanie Dwight
+Carter Busse
+Vijay Tella

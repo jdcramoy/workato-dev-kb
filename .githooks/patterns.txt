@@ -1,0 +1,9 @@
+# workspace/asset numeric IDs in workato URLs
+workato\.com/(recipes|data_tables|folders|jobs)/?[0-9]{6,}
+# bare large IDs that are Workato asset-shaped (tune on false positives)
+# personal names blocklist lives in .githooks/names.txt (one per line)
+# internal jira keys from Josh's estate projects
+\b(BSYS|HROPS|PSY?M|AAI|CT)-[0-9]+\b
+# people-file paths
+knowledge/people/
+\.claude/knowledge/people
