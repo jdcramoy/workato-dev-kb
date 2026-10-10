@@ -1,0 +1,6 @@
+install-logs/
+.venv/
+__pycache__/
+*.pyc
+config.sh
+.DS_Store

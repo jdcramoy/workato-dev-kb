@@ -1,0 +1,2 @@
+{"sources": ["docs", "changelog", "blog", "inspiration", "github", "eip", "claude"],
+ "excluded_by_design": ["confluence", "attachments", "harness"]}
