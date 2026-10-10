@@ -277,8 +277,76 @@ export WORKATO_KB_ROOT="$KB_INSTALL_DIR"
 echo "  ok: corpus + index at $KB_INSTALL_DIR"
 finish_step config
 
-# --- KB steps (models, sync, index, fractal, smoke) land in Task 5 -------------
-# Until those steps are appended, stop honestly here rather than exiting 0 with
-# an install that did not run the pipeline.
-CURRENT_STEP="models"
-fail_step "KB steps (models sync index fractal smoke) are not in this build yet — installer incomplete"
+# --- step: models — pre-download the bge models (longest network op) ----------
+# Fetched through python -c (NOT a heredoc: a heredoc feeds with_retry's stdin
+# once, so a retry would re-run python against an exhausted script). The HF
+# cache under $HOME makes retries resumable rather than restarting downloads.
+begin_step models
+with_retry "pre-download bge models (~2GB, resumable)" 3 python3 -c '
+from sentence_transformers import SentenceTransformer
+for m in ("BAAI/bge-base-en-v1.5", "BAAI/bge-reranker-base"):
+    print("fetching", m); SentenceTransformer(m)
+print("models ready")
+'
+finish_step models
+
+# --- step: sync — per-source degraded semantics --------------------------------
+# A source being down must NOT kill the install: one scoped sync per enabled
+# source, each retried; failures accumulate as DEGRADED. Only a total failure
+# (every source down) is fatal — that is a network/proxy problem, not a source.
+begin_step sync
+mkdir -p "$KB_INSTALL_DIR"
+FAILED_SRC=()
+ENABLED_SRCS=$(python3 -c "import json;print(' '.join(json.load(open('sources/public.json'))['sources']))")
+TOTAL_SRC=0
+for src in $ENABLED_SRCS; do
+  TOTAL_SRC=$((TOTAL_SRC+1))
+  if ! with_retry "sync source: $src" 2 python3 -m kb.sync --sources "$src"; then
+    FAILED_SRC+=("$src")
+  fi
+done
+if [ "${#FAILED_SRC[@]}" -gt 0 ]; then
+  if [ "${#FAILED_SRC[@]}" -eq "$TOTAL_SRC" ]; then
+    fail_step "all $TOTAL_SRC sources failed to sync — network/proxy issue (see classify above)"
+  fi
+  degraded "sources failed to sync: ${FAILED_SRC[*]} — KB works on the rest; re-run ./install.sh later to retry"
+fi
+finish_step sync
+
+# --- step: index — FTS5 + vectors + entropy layers ------------------------------
+begin_step index
+with_retry "build index (FTS5 + vectors + entropy layers)" 2 python3 -m kb.indexer --force
+finish_step index
+
+# --- step: fractal — projection + the AIRTIGHT coverage gate --------------------
+begin_step fractal
+with_retry "build fractal projection" 2 python3 -m kb.fractal build
+COV=$(python3 -m kb.fractal coverage 2>&1) || fail_step "fractal coverage audit crashed: $COV"
+echo "$COV" | grep -qi "AIRTIGHT" || degraded "fractal coverage not AIRTIGHT — audit says: $COV"
+echo "  fractal: $COV"
+finish_step fractal
+
+# --- step: smoke — prove the user's first command works before claiming success --
+# The `kb` wrapper is what the README quickstart tells people to run.
+begin_step smoke
+KBBIN=".venv/bin/kb"
+cat > "$KBBIN" <<'WRAPEOF'
+#!/usr/bin/env bash
+# kb — workato-dev-kb CLI (installed by install.sh)
+# Subcommand form (kb search|fractal|sync|indexer ...) or plain query form
+# (kb "<question>" = kb search "<question>").
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")/../.." && pwd)"
+export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$HERE"
+[ $# -ge 1 ] || { echo "usage: kb \"<question>\"  |  kb search|fractal|sync|indexer [args]"; exit 2; }
+cmd="$1"; shift
+case "$cmd" in
+  search|fractal|sync|indexer) exec python3 -m "kb.$cmd" "$@" ;;
+  *) exec python3 -m kb.search "$cmd" "$@" ;;
+esac
+WRAPEOF
+chmod +x "$KBBIN"
+OUT=$(python3 -m kb.search "how do connectors handle pagination" 2>&1) || fail_step "smoke search crashed: $OUT"
+echo "$OUT" | grep -qE '"doc_id"|url|\[source' || fail_step "smoke search returned no hits-shaped output: $OUT"
+echo "  ok: kb search returns results. Try it: source .venv/bin/activate && kb \"your question\""
+finish_step smoke
