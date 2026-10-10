@@ -321,6 +321,10 @@ finish_step sync
 # --- step: index — FTS5 + vectors + entropy layers ------------------------------
 begin_step index
 with_retry "build index (FTS5 + vectors + entropy layers)" 2 python3 -m kb.indexer --force
+# the entropy column is added by this post-step (kb/entropy.py ALTER TABLE),
+# not by the indexer — and scoped per-source syncs skip it. search's default
+# path selects that column unconditionally, so a fresh install MUST run it.
+with_retry "score chunk entropy (search layer 3)" 2 python3 -m kb.entropy score
 finish_step index
 
 # --- step: fractal — projection + the AIRTIGHT coverage gate --------------------
