@@ -33,7 +33,11 @@ _MD_LINK = re.compile(r"(\]\()([^)\s]+)([^)]*\))")
 
 
 def _corpus_files() -> list[Path]:
-    return [p for p in CORPUS.rglob("*.md") if p.is_file()]
+    # Skip source-repo caches (corpus/<src>/_repo): normalizing their tracked
+    # files dirties the git cache and made the camel nightly pull --ff-only
+    # abort (floor failures 2026-10-12/13). Caches hold raw upstream files.
+    return [p for p in CORPUS.rglob("*.md") if p.is_file()
+            and "_repo" not in p.parts and ".git" not in p.parts]
 
 
 def _stem_index(files: list[Path]) -> dict[str, list[Path]]:

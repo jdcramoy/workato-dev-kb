@@ -24,6 +24,7 @@ Read-only: opens the db read-only (mode=ro) and never writes.
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -55,6 +56,54 @@ def load_factlets(conn):
         "SELECT id, level, length(text), parent, source FROM factlets"
     )
     return cur.fetchall()
+
+
+def _kb_url2path():
+    """docs.url -> docs.path from kb.db (read-only); {} when unavailable.
+
+    Normalizes the two level-1 source conventions (relative path from the
+    kb-chunks layer vs raw doc URL from the section-pass heal) onto one file
+    identity for the section/chunk coverage denominators.
+    """
+    try:
+        kb_db = Path.home() / ".claude/workato-kb/index/kb.db"
+        c = sqlite3.connect(f"file:{kb_db}?mode=ro", uri=True, timeout=30)
+        m = {u: p for u, p in c.execute("SELECT url, path FROM docs WHERE url IS NOT NULL AND path IS NOT NULL")}
+        c.close()
+        return m
+    except Exception:  # noqa: BLE001 - no kb.db: convention fix degrades to no-op
+        return {}
+
+
+def _flat_headingless_docs(paths, url2path):
+    """Of `paths` (corpus relative paths), the set whose kb.db docs have ZERO
+    ##/###-heading-initial chunks — the by-design flat docs (no section rung
+    is ever built for them). Read-only; returns {} when kb.db is unavailable.
+    """
+    if not paths:
+        return set()
+    url2p = {v: k for k, v in url2path.items()}
+    wanted_urls = {url2p[p] for p in paths if p in url2p}
+    if not wanted_urls:
+        return set()
+    try:
+        kb_db = Path.home() / ".claude/workato-kb/index/kb.db"
+        c = sqlite3.connect(f"file:{kb_db}?mode=ro", uri=True, timeout=30)
+        c.execute("CREATE TEMP TABLE wanted(url TEXT PRIMARY KEY)")
+        c.executemany("INSERT OR IGNORE INTO wanted VALUES (?)", [(u,) for u in wanted_urls])
+        heading_urls = set()
+        for url, text in c.execute(
+            "SELECT d.url, c.text FROM chunks c JOIN docs d ON d.doc_id=c.doc_id "
+            "JOIN wanted w ON w.url=d.url"
+        ):
+            first = (text or "").lstrip().split("\n", 1)[0]
+            if re.match(r"^#{2,3}\s", first):
+                heading_urls.add(url)
+        c.close()
+        flat_urls = wanted_urls - heading_urls
+        return {p for p in paths if url2p.get(p, p) in flat_urls}
+    except Exception:  # noqa: BLE001 - degrade to conservative (no exclusions)
+        return set()
 
 
 def _kb_chunkable_urls():
@@ -112,7 +161,17 @@ def audit(db_path, kb_urls=None):
     # reaches the file's id (strict parent links) or when it carries the same
     # source path (the linkage convention used at ingestion time). Union of
     # both, so the audit is robust to which convention the repair lands on.
-    file_sources = {r[3] for r in by_level.get(1, []) if r[3]}
+    # Two level-1 source conventions exist for corpus docs: a relative path
+    # (kb-chunks layer) and the doc URL (section-pass heal). Map URL-source
+    # factlets onto the doc's relative path via kb.db so both conventions
+    # credit the SAME file identity — otherwise the heal-emitted half counts
+    # as an uncreditable section-less file (the phantom 2.5k of 2026-10-11).
+    url2path = _kb_url2path()
+    def norm_src(s):
+        if s and str(s).startswith("http"):
+            return url2path.get(s, s)
+        return s
+    file_sources = {norm_src(r[3]) for r in by_level.get(1, []) if r[3]}
 
     # ancestors for level-2/3: resolve each row's parent chain to a level-1 id
     parent_of = {r[0]: r[3] for r in rows}
@@ -153,7 +212,7 @@ def audit(db_path, kb_urls=None):
                 break
             cur = parent_of.get(cur)
         if found is not None:
-            src1 = level1_source.get(found)
+            src1 = norm_src(level1_source.get(found))
             if src1:
                 (sec_via_link if level == 2 else chunk_via_link).add(src1)
 
@@ -191,7 +250,14 @@ def audit(db_path, kb_urls=None):
     n_files = len(file_sources_sections)
     files_with_sections = len(file_sources_sections & sec_via_link)
     files_with_chunks = len(file_sources_chunks & chunk_via_link)
-    sections_pct = (100.0 * files_with_sections / n_files) if n_files else 0.0
+    # Flat-by-design docs: the projection deliberately hangs chunks straight off
+    # the file rung for docs with NO ##/### headings (essay/blog prose; see the
+    # kbsec block in fractal.py — "nothing to section here"). Those are a fact
+    # about the source's shape, not a broken section rung: exclude them from
+    # the sections denominator (same spirit as the hubs exclusion).
+    flat_docs = _flat_headingless_docs(file_sources_sections - sec_via_link, url2path)
+    n_files_sections_gate = n_files - len(flat_docs)
+    sections_pct = (100.0 * files_with_sections / n_files_sections_gate) if n_files_sections_gate else 0.0
     n_chunkable = len(file_sources_chunks)
     chunks_pct = (100.0 * files_with_chunks / n_chunkable) if n_chunkable else 0.0
 
@@ -212,8 +278,9 @@ def audit(db_path, kb_urls=None):
     # -- verdicts ---------------------------------------------------------------
     verdicts = {
         "sections": {
-            "bar": ">= {:.0f}% of files with >=1 section".format(BAR_SECTIONS_PCT),
+            "bar": ">= {:.0f}% of non-flat files with >=1 section".format(BAR_SECTIONS_PCT),
             "observed": round(sections_pct, 2),
+            "flat_excluded": len(flat_docs),
             "pass": sections_pct >= BAR_SECTIONS_PCT,
         },
         "chunks": {

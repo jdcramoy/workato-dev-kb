@@ -45,14 +45,20 @@ def parse_llms(text: str) -> list[TocEntry]:
     entries: list[TocEntry] = []
     section = ""
     subsection = ""
+    # llms.txt sites disagree on heading levels: Workato/Claude use `###` for
+    # sections, Temporal-style indexes use `##`. When a file has no `###`
+    # headings at all, `##` is the section level (additive — never fires for
+    # the Workato/Claude shape).
+    sec_level = "## " if ("### " not in text and "\n## " in text) else "### "
+    sub_level = "### " if sec_level == "## " else "#### "
     for line in text.splitlines():
         line = line.rstrip()
-        if line.startswith("### "):
-            section = line[4:].strip()
+        if line.startswith(sec_level):
+            section = line[len(sec_level):].strip()
             subsection = ""
             continue
-        if line.startswith("#### "):
-            subsection = line[5:].strip()
+        if line.startswith(sub_level):
+            subsection = line[len(sub_level):].strip()
             continue
         m = _ENTRY_RE.match(line)
         if m:

@@ -129,19 +129,17 @@ def _split_headings(body: str) -> list[str]:
 
 
 def _doc_iter():
-    """Yield (source, url, path, title, section, sha256, text) for every manifest record."""
-    sources = {
-        "docs": None,  # resolved from manifest path
-        "changelog": "changelog",
-        "blog": "blog",
-        "inspiration": "inspiration",
-        "github": "github",
-        "eip": "eip",
-        "claude": "claude",
-        "hubs": "hubs",  # generated cluster hub notes (kb.hubs) — fractal topic layer
-    }
+    """Yield (source, url, path, title, section, sha256, text) for every manifest record.
+
+    Discovery is fully manifest-driven: every manifest/*.jsonl is a source
+    (confluence-<alias> labels as confluence/<alias>). A newly-wired source
+    syncs, manifests, and indexes with no edit here — the old hardcoded dict
+    silently excluded the 2026-10-11 scout sources (same bug class as the
+    confluence-space one fixed 2026-10-10).
+    """
+    sources = sorted(mp.stem for mp in (DATA_ROOT / "manifest").glob("*.jsonl"))
     corpus = DATA_ROOT / "corpus"
-    for source, subdir in sources.items():
+    for source in sources:
         manifest = load_manifest(source)
         for url, rec in manifest.items():
             rel = rec.get("path", "")
@@ -236,6 +234,28 @@ def build(force: bool = False, with_embeddings: bool = True) -> dict:
             )
         stats["embedded"] = len(vecs)
         db.commit()
+
+    # self-heal: only chunks INSERTED in a run get embedded there. A build
+    # killed mid-embed leaves committed chunks vectorless, and later runs
+    # skip unchanged docs — nothing would ever backfill them (2026-10-14:
+    # 4,535 slack chunks stranded this way by a killed index step). Embed
+    # text is reconstructable from the stored context header + chunk body.
+    if with_embeddings:
+        missing = db.execute(
+            "SELECT c.chunk_id, c.context, c.text FROM chunks c "
+            "LEFT JOIN chunks_vec v ON v.chunk_id = c.chunk_id "
+            "WHERE v.chunk_id IS NULL"
+        ).fetchall()
+        if missing:
+            print(f"backfilling {len(missing)} unembedded chunks ...", flush=True)
+            vecs = _embed_texts([f"{ctx}\n\n{text}" for _, ctx, text in missing])
+            for (cid, _, _), v in zip(missing, vecs):
+                db.execute(
+                    "INSERT OR REPLACE INTO chunks_vec(chunk_id,embedding) VALUES(?,?)",
+                    (cid, struct.pack(f"{len(v)}f", *v)),
+                )
+            stats["backfilled"] = len(vecs)
+            db.commit()
 
     db.close()
     return stats
