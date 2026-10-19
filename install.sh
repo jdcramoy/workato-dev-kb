@@ -35,7 +35,7 @@ echo "install log: $LOG"
 # STEPS is the ordered install pipeline. CURRENT_STEP is the one in flight.
 # COMPLETED accumulates finished steps; DEGRADED accumulates non-fatal
 # failures (installed-but-partial) that get a fix-it summary at the end.
-STEPS=(prereqs venv config models sync index fractal smoke)
+STEPS=(prereqs venv config models sync index corpus fractal smoke)
 CURRENT_STEP="startup"
 COMPLETED=()
 DEGRADED=()
@@ -169,6 +169,20 @@ with_retry_stream() { # with_retry_stream <desc> <attempts> <cmd...> — same
 }
 
 echo "== workato-dev-kb installer =="
+
+# --- flag parsing: the one optional add-on is the team knowledge corpus -------
+# --with-corpus installs the Workato-All/knowledge-corpus tree (the sanitized,
+# team-shared knowledge tree) into ~/.claude/knowledge, where the fractal
+# layer indexes it. Internal-only: the corpus repo is not public, so a failed
+# clone DEGRADES instead of aborting and public users get the plain install.
+WITH_CORPUS=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --with-corpus) WITH_CORPUS=1 ;;
+    *) echo "unknown flag: $1 (supported: --with-corpus)"; exit 2 ;;
+  esac
+  shift
+done
 
 # --- interactive detection + fix engine ---------------------------------------
 INTERACTIVE="[ -t 0 ]"
@@ -329,6 +343,52 @@ with_retry "build index (FTS5 + vectors + entropy layers)" 2 python3 -m kb.index
 # path selects that column unconditionally, so a fresh install MUST run it.
 with_retry "score chunk entropy (search layer 3)" 2 python3 -m kb.entropy score
 finish_step index
+
+# --- step: corpus — optionally install the team knowledge tree ------------------
+# With --with-corpus, clone Workato-All/knowledge-corpus (the sanitized,
+# team-shared export of the harness knowledge tree) into ~/.claude/knowledge
+# so the fractal step indexes real doctrine instead of the empty scaffold.
+# Safety rules, in order:
+#   1. An existing tree with an INDEX.md is NEVER overwritten. A tree whose
+#      origin is the corpus repo gets a fast-forward pull; a personal tree is
+#      left untouched with a DEGRADED note.
+#   2. A non-empty directory without INDEX.md is left untouched too (could be
+#      personal content mid-setup) — no rm -rf on anything we cannot identify.
+#   3. A failed clone (internal-only repo, no access) DEGRADES and clears only
+#      a partial clone, so the fractal step's scaffold seed still applies.
+begin_step corpus
+KT_CORPUS_URL="https://github.com/Workato-All/knowledge-corpus.git"
+KT_HOME="$HOME/.claude/knowledge"
+if [ "$WITH_CORPUS" -ne 1 ]; then
+  echo "  skipped: pass --with-corpus to install the team knowledge corpus (Workato-All members)"
+elif [ -f "$KT_HOME/INDEX.md" ]; then
+  if git -C "$KT_HOME" remote get-url origin 2>/dev/null | grep -q "knowledge-corpus"; then
+    with_retry "update team corpus (git pull)" 2 git -C "$KT_HOME" pull --ff-only
+    echo "  ok: team corpus updated at $KT_HOME"
+  else
+    degraded "existing knowledge tree at $KT_HOME is not a corpus clone — left untouched (move it aside or install the corpus manually if you want it replaced)"
+  fi
+elif [ -d "$KT_HOME" ] && [ -n "$(ls -A "$KT_HOME" 2>/dev/null)" ]; then
+  degraded "$KT_HOME exists but has no INDEX.md and is not empty — left untouched (verify its contents, then re-run)"
+else
+  rm -rf "$KT_HOME"  # safe: absent, or present-but-empty
+  # plain HTTPS first; if auth fails and gh is available, gh's own credential
+  # path (keychain token) usually succeeds where bare git prompts.
+  CLONE_OK=0
+  if with_retry "clone team knowledge corpus" 2 git clone --depth 1 "$KT_CORPUS_URL" "$KT_HOME"; then
+    CLONE_OK=1
+  elif command -v gh >/dev/null && \
+       with_retry "clone team knowledge corpus via gh" 2 gh repo clone Workato-All/knowledge-corpus "$KT_HOME" -- --depth 1; then
+    CLONE_OK=1
+  fi
+  if [ "$CLONE_OK" -eq 1 ]; then
+    echo "  ok: team knowledge corpus installed at $KT_HOME"
+  else
+    rm -rf "$KT_HOME"  # clear the partial clone so the fractal scaffold seed works
+    degraded "could not clone knowledge-corpus — it is internal-only (Workato-All GitHub access required). Continuing without it; re-run ./install.sh --with-corpus once you have access"
+  fi
+fi
+finish_step corpus
 
 # --- step: fractal — projection + the AIRTIGHT coverage gate --------------------
 begin_step fractal

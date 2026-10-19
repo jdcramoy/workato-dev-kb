@@ -19,6 +19,21 @@ python3.12 venv, downloads the embedding models, syncs the public sources,
 builds the index and fractal projection, and runs a smoke query to prove your
 first search works. It is safe to re-run at any point.
 
+### Workato-All teammates: one command gets everything
+
+```bash
+./install.sh --with-corpus
+```
+
+`--with-corpus` also installs the team knowledge corpus
+([Workato-All/knowledge-corpus](https://github.com/Workato-All/knowledge-corpus),
+the sanitized team-shared knowledge tree) into `~/.claude/knowledge`, where
+the fractal layer indexes it — so the memory layer answers from real build
+doctrine, not just the scaffold. An existing knowledge tree is never
+overwritten: a corpus clone gets updated in place, a personal tree is left
+untouched. The corpus repo is internal-only; without access the installer
+degrades gracefully and continues without it.
+
 ## Sources
 
 | Source | What it holds |
