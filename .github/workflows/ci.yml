@@ -1,0 +1,46 @@
+name: ci
+
+# Guards for the installable pack: shell correctness (syntax + shellcheck at
+# error severity), the kb package compiles, and the flag parser rejects
+# unknown flags (exit 2) so a typo like --with-corpous fails loud, not quiet.
+# Deliberately does NOT run the real installer: it downloads ~2GB of models
+# and builds a multi-GB index — CI proves the scripts are sound, not that the
+# network holds. The installer's own degraded/failure semantics cover the rest.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint-and-guards:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      - name: Syntax-check every shell script (bash -n)
+        run: |
+          find . -name '*.sh' -not -path './.git/*' -print0 | xargs -0 -n1 bash -n
+
+      - name: Shellcheck (error severity)
+        run: |
+          find . -name '*.sh' -not -path './.git/*' -print0 | \
+            xargs -0 shellcheck --severity=error
+
+      - name: Compile-check the kb package
+        run: python3 -m compileall -q kb
+
+      - name: Flag parser rejects unknown flags (exit 2)
+        run: |
+          set +e
+          ./install.sh --definitely-not-a-flag >/dev/null 2>&1
+          rc=$?
+          set -e
+          [ "$rc" -eq 2 ] || {
+            echo "expected exit 2 for an unknown flag, got $rc"
+            exit 1
+          }

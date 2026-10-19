@@ -26,6 +26,14 @@ LOG="${LOG_DIR}/install-$(date +%Y%m%d-%H%M%S).log"
 exec > >(tee -a "$LOG" 2>&1)
 echo "install log: $LOG"
 
+# fail_step must be DEFINED before any use: bash parses top-down, so a
+# definition later in the file is not available to a call this early, and the
+# incomplete-checkout guard below would lose its message ("command not found").
+fail_step() { # fail_step <message> — fatal; the EXIT trap adds context
+  echo "FAIL: $1"
+  exit 1
+}
+
 # fail fast on an incomplete checkout: without the kb/ package every downstream
 # step would fail after minutes of downloads instead of now
 [ -f kb/sync.py ] && [ -f kb/search.py ] || \
@@ -54,11 +62,6 @@ finish_step() { # finish_step <name> — mark it completed
 degraded() { # degraded <description including the exact fix command>
   echo "  DEGRADED: $1"
   DEGRADED+=("$1")
-}
-
-fail_step() { # fail_step <message> — fatal; the EXIT trap adds context
-  echo "FAIL: $1"
-  exit 1
 }
 
 cleanup_tmp() { # remove any temp files this run created (never returns nonzero:
