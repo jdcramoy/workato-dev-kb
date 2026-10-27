@@ -42,6 +42,10 @@ REPOS = {
     # architecture canon but nothing FROM Workato's own engineering.
     "workato-connector-sdk": "https://github.com/workato/workato-connector-sdk.git",  # MIT
     "custom-connector-docs": "https://github.com/workato/custom_connector_docs.git",
+    # Vendor-canon wave 2 (Josh 2026-10-16: "ALL of the workato code"):
+    # on-prem agent OPA extensions + Edge Gateway deployment charts
+    "opa-extensions": "https://github.com/workato/opa-extensions.git",
+    "edge-gateway-helm-charts": "https://github.com/workato/edge-gateway-helm-charts.git",
     # Wave 5 (2026-10-15, Josh): developer-roadmap content (364MB repo, content
     # is all under content/ — sparse blobless checkout) + the llms.txt directory
     # README (the site data itself is mined by kb/llms_scout.py, see below).
@@ -65,6 +69,18 @@ HTML_SKIP_PARTS = {"examples", "images", "scripts", "styles", "site"}
 # Scout repos: azure includes snippets, cloudevents drafts/future, artwork dirs.
 SKIP_PARTS = {"solutions", "translations", "images", "assets", ".github",
               "includes", "drafts", "future", "artwork", "snippets"}
+
+# Code-as-knowledge (audit 2026-10-16, Josh: "ALL of the workato code ... so we
+# can provide feedback to the product team"): the SDK repos were cloned but
+# yield ~nothing under the md/html rule — the knowledge IS the Ruby source
+# (SDK ground truth) and the 96 canonical connector examples. Extra extensions
+# ingested IN ADDITION to .md/.html, per repo.
+CODE_EXTENSIONS = {
+    "workato-connector-sdk": {".rb", ".gemspec"},
+    "custom-connector-docs": {".rb"},
+    "opa-extensions": {".java", ".yaml"},
+    "edge-gateway-helm-charts": {".yaml", ".tpl"},
+}
 
 
 def _update_repo(name: str, url: str, dest: Path, sparse_dirs: list[str] | None = None) -> str:
@@ -93,8 +109,9 @@ def _update_repo(name: str, url: str, dest: Path, sparse_dirs: list[str] | None 
 def _iter_markdown(repo_dir: Path, name: str = "") -> list[Path]:
     out = []
     html = name in HTML_REPOS
+    code_exts = CODE_EXTENSIONS.get(name, set())
     for p in sorted(repo_dir.rglob("*")):
-        if p.suffix not in (".md", ".html"):
+        if p.suffix not in (".md", ".html") and p.suffix not in code_exts:
             continue
         if html and p.suffix == ".md":
             continue  # html repos: ingest the .html content converted below

@@ -61,9 +61,10 @@ def load_factlets(conn):
 def _kb_url2path():
     """docs.url -> docs.path from kb.db (read-only); {} when unavailable.
 
-    Normalizes the two level-1 source conventions (relative path from the
-    kb-chunks layer vs raw doc URL from the section-pass heal) onto one file
-    identity for the section/chunk coverage denominators.
+    Normalizes the level-1 source conventions (relative path from the
+    kb-chunks layer, raw doc URL from the section-pass heal, AND pseudo-URLs
+    like pwc://... / workday://... from manifest-keyed catalog sources) onto
+    one file identity for the section/chunk coverage denominators.
     """
     try:
         kb_db = Path.home() / ".claude/workato-kb/index/kb.db"
@@ -168,8 +169,12 @@ def audit(db_path, kb_urls=None):
     # as an uncreditable section-less file (the phantom 2.5k of 2026-10-11).
     url2path = _kb_url2path()
     def norm_src(s):
-        if s and str(s).startswith("http"):
-            return url2path.get(s, s)
+        # map BOTH conventions onto the relative path: raw doc URLs (https://)
+        # from the section-pass heal AND pseudo-URLs (pwc://, workday://,
+        # apis-guru:// — manifest-keyed catalog sources) whose "url" is not a
+        # web address. Anything that IS a docs.url key resolves to its path.
+        if s and s in url2path:
+            return url2path[s]
         return s
     file_sources = {norm_src(r[3]) for r in by_level.get(1, []) if r[3]}
 
@@ -233,17 +238,17 @@ def audit(db_path, kb_urls=None):
             continue
         if source.startswith("hubs/") or source.startswith("hubs://"):
             continue  # synthetic cluster indexes: no chunk rung by design
-        if source.startswith("http"):
-            needs_chunks.add(source)  # corpus doc: its level-1 factlet is a summary
+        if source in url2path or source.startswith("http"):
+            needs_chunks.add(norm_src(source))  # corpus doc (incl. pseudo-URL sources): level-1 is a summary
         elif (tlen or 0) >= 8000:
-            needs_chunks.add(source)  # oversized local file truncated at the factlet cap
+            needs_chunks.add(norm_src(source))  # oversized local file truncated at the factlet cap
     # corpus docs with ZERO chunks in kb.db have no chunkable content (empty
     # bodies, press releases, stub pages): their missing chunk rung is a fact
     # about the source, not a defect — exclude from the denominator
     chunkable = kb_urls if kb_urls is not None else _kb_chunkable_urls()
     if chunkable is not None:
-        needs_chunks = {s for s in needs_chunks if not s.startswith("http")} | (
-            {s for s in needs_chunks if s.startswith("http")} & chunkable
+        needs_chunks = {s for s in needs_chunks if not (s in url2path or s.startswith("http"))} | (
+            {s for s in needs_chunks if s in url2path or s.startswith("http")} & chunkable
         )
     file_sources_chunks = needs_chunks
 

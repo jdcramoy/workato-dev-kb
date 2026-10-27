@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -30,17 +31,90 @@ from .common import DATA_ROOT, fetch_cached
 CORE_SOURCES = {"docs", "blog", "changelog", "inspiration", "github", "eip", "claude",
                 "temporal", "n8n", "prefect", "restate", "mcp", "rss", "webcrawl", "camel", "slack",
                 "workday", "atlassian",
+                # wave 1/3 stragglers wired 2026-10-16 (audit finding: ingested but
+                # never given a nightly step — same silent-gap class as the confluence
+                # spaces): snowflake recursive llms walk, dbt, trigger.dev
+                "snowflake", "dbt", "trigger",
                 # wave 5 (2026-10-15): HF library docs, Papers-with-Code
                 # dumps, API catalogs (apis.guru / terraform registry / figshare
                 # computing-sciences) — llms_scout is a REPORT step, not core
                 # (a directory repo going down must not fail the nightly floor)
                 "hf-datasets", "hf-hub", "hf-transformers", "hf-diffusers", "hf-peft",
-                "hf-accelerate", "pwc", "apis-guru", "terraform-registry", "figshare"}
+                "hf-accelerate", "pwc", "apis-guru", "terraform-registry", "figshare",
+                "langchain-hub"}
 
 
 def _step_healthy(result) -> bool:
     """A step is healthy when it ran and did not record an error (skips count as ran)."""
     return isinstance(result, dict) and not result.get("error")
+
+
+# --- machine-health guards (2026-10-16 postmortem, machine-health.md) --------
+# The 2026-10-16 crash night: a detached kb.sync grew to 35GB / 36 idle threads
+# in 4.5h (swap 12->30GB, load 110) and, on later nights, successor runs died
+# to SIGKILL inside hubs/hdbscan under the same memory pressure. Two guards:
+#   single-flight  — only one kb.sync may run at a time (flock; auto-released
+#                    on process death, so stale locks self-heal)
+#   memory cap     — a background watcher self-aborts the run when its own RSS
+#                    exceeds KB_SYNC_MEM_CAP_GB (default 8) — well above a
+#                    healthy full sync (~2-3.5GB), far below runaway territory
+# On breach the run aborts loudly; the crash-resilient partial report on disk
+# already parses, and the digest falls back to last-good (2026-10-22 fix).
+SYNC_MEM_CAP_GB = float(os.environ.get("KB_SYNC_MEM_CAP_GB", "8"))
+
+
+def _acquire_single_flight():
+    """flock-based single-flight lock. Returns the lock file handle (caller
+    keeps it alive for the process lifetime) or exits if another run holds it."""
+    import fcntl
+
+    fh = open(DATA_ROOT / "sync.lock", "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        print("[sync] single-flight: another kb.sync holds sync.lock — exiting "
+              "(machine-health guard)", flush=True)
+        raise SystemExit(0)
+    fh.write(str(os.getpid()))
+    fh.flush()
+    return fh
+
+
+def _start_memory_guard(cap_gb: float, report_path: Path) -> None:
+    """Watch own peak RSS; self-abort past the cap so this process can never
+    repeat the 35GB runaway. ru_maxrss is PEAK RSS: on macOS bytes, on Linux
+    kilobytes."""
+    import resource
+    import threading
+    import time
+
+    def _rss_gb() -> float:
+        ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return ru / (1024 ** 3) if sys.platform == "darwin" else ru / (1024 ** 2)
+
+    def _watch() -> None:
+        while True:
+            time.sleep(30)
+            rss = _rss_gb()
+            if rss <= cap_gb:
+                continue
+            try:  # stamp the partial report before dying — it already parses
+                rep = json.loads(report_path.read_text())
+                rep.setdefault("errors", []).append(
+                    f"memory cap: RSS {rss:.1f}GB exceeded {cap_gb}GB cap — run self-aborted "
+                    "(machine-health 2026-10-16 guard; partial report on disk)"
+                )
+                tmp = report_path.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(rep, indent=2))
+                tmp.replace(report_path)
+            except Exception:  # noqa: BLE001 - the abort itself must not fail
+                pass
+            print(f"[sync] MEMORY CAP {cap_gb}GB exceeded (RSS {rss:.1f}GB) — self-aborting; "
+                  "partial report on disk", flush=True)
+            os._exit(1)
+
+    threading.Thread(target=_watch, daemon=True, name="kb-sync-mem-guard").start()
 
 
 def _previous_report(today: str):
@@ -70,6 +144,39 @@ def main() -> None:
     results: dict = {}
     errors: list[str] = []
 
+    today = dt.date.today().isoformat()
+    diff_dir = DATA_ROOT / "diffs"
+    diff_dir.mkdir(parents=True, exist_ok=True)
+    # scoped runs get a .scoped suffix so they never clobber the nightly full
+    # report for the same date (both used to write {date}.json — the full
+    # reports for 10-09 and 10-10 were lost to exactly this)
+    fname = f"{today}.json" if scope == "full" else f"{today}.scoped.json"
+    diff_path = diff_dir / fname
+
+    # machine-health guards (2026-10-16): single-flight lock, then the
+    # self-abort memory watchdog. Lock handle is held for the process lifetime.
+    _sync_lock = _acquire_single_flight()
+    _start_memory_guard(SYNC_MEM_CAP_GB, diff_path)
+
+    def _write_report(partial: bool) -> None:
+        # Crash resilience: this nightly has been hard-killed mid-run before
+        # (jetsam inside the hubs clustering, 2026-10-15..19 — five nights with
+        # no diffs/<date>.json and a SYNC FAILED morning digest). A report that
+        # only lands at the END turns any hard kill into a missing report, so
+        # rewrite it after every step; a killed run then leaves a parseable
+        # partial report instead of nothing. Atomic tmp+replace: the gate reads
+        # this file concurrently.
+        report = {
+            "date": today,
+            "scope": scope,
+            "partial": partial,
+            "results": results,
+            "errors": errors,
+        }
+        tmp = diff_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(report, indent=2))
+        tmp.replace(diff_path)
+
     def try_step(name: str, fn, *args, **kwargs):
         if wanted and name not in wanted:
             return
@@ -79,13 +186,16 @@ def main() -> None:
         except Exception as e:  # noqa: BLE001 - nightly job records, never dies silently
             errors.append(f"{name}: {e}")
             results[name] = {"error": str(e)}
+        _write_report(partial=True)
 
     from . import atlassian_source, camel_source, contextualize, docs_source, eip_source, github_source, html_source, links, llms_source, rss_source, wp_source, workday_source
     try:  # wave-5 sources: record an error, never kill the nightly on import
         from . import apis_guru_source, figshare_source, llms_scout, pwc_source, terraform_source
+        from . import langchain_hub_source
     except ImportError as e:
         errors.append(f"wave-5 source import: {e}")
         apis_guru_source = figshare_source = llms_scout = pwc_source = terraform_source = None
+        langchain_hub_source = None
     from .entropy import score as entropy_score
     from .funnel import build as funnel_build
     from .indexer import build
@@ -111,7 +221,8 @@ def main() -> None:
     try_step("claude", llms_source.sync, "claude")
     # scout-expanded llms.txt sites (2026-10-10): each is its own core step so
     # the nightly floor catches a single site going down
-    for _site in ("temporal", "n8n", "prefect", "restate", "mcp", "slack"):
+    for _site in ("temporal", "n8n", "prefect", "restate", "mcp", "slack",
+                  "snowflake", "dbt", "trigger"):
         try_step(_site, llms_source.sync, _site)
     # wave 5: Hugging Face library docs (llms.txt + .md twins, version-stripped)
     for _site in ("hf-datasets", "hf-hub", "hf-transformers", "hf-diffusers", "hf-peft", "hf-accelerate"):
@@ -135,6 +246,10 @@ def main() -> None:
         try_step("terraform-registry", terraform_source.sync)
     if figshare_source is not None:
         try_step("figshare", figshare_source.sync)
+    if langchain_hub_source is not None:
+        # wave 5b (Josh "go nuts"): full public prompt catalog + templates via
+        # api.hub.langchain.com/repos listing + per-repo commit manifests
+        try_step("langchain-hub", langchain_hub_source.sync)
     # llms.txt directory scout (wave 5): refreshes the candidate-site queue
     # from the two directory repos — REPORT step, never core (the human works the
     # queue in waves; auto-ingest is deliberately out of scope)
@@ -179,8 +294,6 @@ def main() -> None:
         except Exception as e:  # noqa: BLE001
             errors.append(f"lateral: {e}")
 
-    today = dt.date.today().isoformat()
-
     # --- source-count floor (full runs only) ---------------------------------
     # Fails loudly instead of silently writing a shrunken corpus/index.
     floor_failures: list[str] = []
@@ -206,16 +319,12 @@ def main() -> None:
                 floor_failures.append(
                     f"collapse check: 0 docs changed across all sources vs {prev_changed} in the previous run"
                 )
-    report = {"date": today, "scope": scope, "results": results, "errors": errors}
+    report = {"date": today, "scope": scope, "partial": False, "results": results, "errors": errors}
     if floor_failures:
         report["floor_failures"] = floor_failures
-    diff_dir = DATA_ROOT / "diffs"
-    diff_dir.mkdir(parents=True, exist_ok=True)
-    # scoped runs get a .scoped suffix so they never clobber the nightly full
-    # report for the same date (both used to write {date}.json — the full
-    # reports for 10-09 and 10-10 were lost to exactly this)
-    fname = f"{today}.json" if scope == "full" else f"{today}.scoped.json"
-    (diff_dir / fname).write_text(json.dumps(report, indent=2))
+    tmp = diff_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(report, indent=2))
+    tmp.replace(diff_path)
 
 
 
@@ -223,6 +332,29 @@ def main() -> None:
     if floor_failures:
         # loud failure AFTER the report + bus alert are on disk
         raise SystemExit(1)
+
+
+def _last_bus_sync_is_alert(bus: Path) -> bool:
+    """True if the most recent sync bus record in this file is an unresolved
+    sync_alert (any date). Reads only the tail — the bus is append-only.
+    Used to downgrade a passing run's bus post to type "sync_recovery" so a
+    floor failure gets a visible all-clear instead of silence."""
+    try:
+        with bus.open("rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 65536))
+            tail = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return False
+    for line in reversed(tail.splitlines()):
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("type") in ("sync_alert", "sync_report", "sync_recovery"):
+            return rec.get("type") == "sync_alert"
+    return False
 
 
 

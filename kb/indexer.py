@@ -16,6 +16,7 @@ import json
 import re
 import sqlite3
 import struct
+import time
 from pathlib import Path
 
 from .common import DATA_ROOT, load_manifest
@@ -173,7 +174,7 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
     return vecs
 
 
-def build(force: bool = False, with_embeddings: bool = True) -> dict:
+def build(force: bool = False, with_embeddings: bool = True, skip_fts: bool = False) -> dict:
     db = get_db()
     stats = {"docs_added": 0, "docs_updated": 0, "chunks": 0, "embedded": 0, "removed": 0}
 
@@ -256,6 +257,17 @@ def build(force: bool = False, with_embeddings: bool = True) -> dict:
                 )
             stats["backfilled"] = len(vecs)
             db.commit()
+
+    # FTS maintenance: chunks_fts is EXTERNAL-CONTENT fts5 over chunks with no
+    # triggers — nothing ever populated it, so the BM25 leg of hybrid search
+    # was silently dead (audit 2026-10-16: fts_idx had 0 rows, even in the
+    # 2026-10-08 backup; every query ran dense-only). An 11s rebuild over the
+    # full corpus beats trigger bookkeeping and guarantees exact sync.
+    if not skip_fts:
+        t0 = time.time()
+        db.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+        db.commit()
+        stats["fts_rebuild_s"] = round(time.time() - t0, 1)
 
     db.close()
     return stats

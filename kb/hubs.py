@@ -44,6 +44,16 @@ MIN_CLUSTERS = 30
 MAX_CLUSTERS = 150
 SHOW_MEMBERS = 30
 HDBSCAN_MIN_CLUSTER = 5
+# O(n^2)-memory methods (sklearn HDBSCAN brute pairwise, scipy pdist/linkage)
+# are SKIPPED above this doc count: the condensed distance matrix alone is
+# n^2/2 * 8 bytes (~6.4 GB at 40k docs), and the wave-5 corpus (2026-10-15)
+# grew the nightly to 105k+ docs -> macOS jetsam-killed the python process
+# mid-cluster with no traceback, so the sync died before it could write its
+# diff report (five nights 2026-10-15..19 silently produced no diffs/*.json).
+# 40k keeps the full-corpus O(n^2) paths at the size the Oct-14 nightly
+# (38,737 docs) actually completed. Above the cap, cluster a deterministic
+# subsample and centroid-assign the rest (coherence gate + orphans preserved).
+O2_METHOD_CAP = 40_000
 # Euclidean on unit-normalized vectors: 0.62 ~ cos sim 0.81, 1.0 ~ cos sim 0.5.
 # Sweep is wide because the corpus holds many small tight groups that only
 # merge at high distances.
@@ -124,26 +134,41 @@ def _doc_embed_text(doc: dict) -> str:
 def _doc_vectors(docs: list[dict]) -> np.ndarray:
     """Doc embedding matrix: reuse the indexer's first-chunk vectors (which are
     embed(context_header + first chunk)); re-embed only docs whose vec row is
-    missing, batched on the same bge model."""
+    missing, batched on the same bge model.
+
+    Persistence fix (triage kb-embed-464-stuck-vectors, 2026-10-22): the
+    re-embeddings used to live ONLY in the returned matrix — never written
+    back to chunks_vec. Hubs runs BEFORE the index step each night, so every
+    doc (re-)chunked since the last index build looks "missing first-chunk
+    vector" here; when the nightly then died at hubs (hdbscan SIGKILL,
+    2026-10-15..19), the index step never ran and the same docs re-embedded
+    night after night without ever persisting. Now each re-embedded doc's
+    vector is written back to chunks_vec (delete-then-insert — vec0 has no
+    working INSERT OR REPLACE), so the loop converges even on nights the
+    index step never completes.
+    """
     db = get_db()
     row = db.execute("SELECT embedding FROM chunks_vec LIMIT 1").fetchone()
     dim = len(row[0]) // 4 if row else 768
 
     vecs = np.zeros((len(docs), dim), dtype=np.float32)
     missing: list[int] = []
+    missing_chunk_ids: dict[int, int] = {}  # docs index -> chunk_id of first chunk
     for i, doc in enumerate(docs):
         r = db.execute(
             """
-            SELECT v.embedding FROM chunks c
-            JOIN chunks_vec v ON v.chunk_id = c.chunk_id
+            SELECT c.chunk_id, v.embedding FROM chunks c
+            LEFT JOIN chunks_vec v ON v.chunk_id = c.chunk_id
             WHERE c.doc_id = ? AND c.chunk_ord = 0
             """,
             (doc["doc_id"],),
         ).fetchone()
-        if r:
-            vecs[i] = np.array(struct.unpack(f"{dim}f", r[0]), dtype=np.float32)
+        if r and r[1] is not None:
+            vecs[i] = np.array(struct.unpack(f"{dim}f", r[1]), dtype=np.float32)
         else:
             missing.append(i)
+            if r and r[0] is not None:
+                missing_chunk_ids[i] = r[0]
     db.close()
 
     if missing:
@@ -155,6 +180,24 @@ def _doc_vectors(docs: list[dict]) -> np.ndarray:
             emb = model.encode(batch, normalize_embeddings=True, show_progress_bar=False)
             vecs[s : s + len(batch)] = np.asarray(emb, dtype=np.float32)
             print(f"  embedded {min(s + EMBED_BATCH, len(texts))}/{len(texts)}", flush=True)
+        # persist the re-embeddings so the next night finds them (convergence)
+        db = get_db()
+        persisted = 0
+        for i, emb_idx in enumerate(missing):
+            cid = missing_chunk_ids.get(emb_idx)
+            if cid is None:
+                continue  # doc has no first chunk — nothing to persist against
+            v = vecs[emb_idx]
+            db.execute("DELETE FROM chunks_vec WHERE chunk_id=?", (cid,))
+            db.execute(
+                "INSERT INTO chunks_vec(chunk_id,embedding) VALUES(?,?)",
+                (cid, struct.pack(f"{len(v)}f", *v)),
+            )
+            persisted += 1
+        db.commit()
+        db.close()
+        if persisted:
+            print(f"  persisted {persisted} first-chunk vectors back to chunks_vec", flush=True)
     return vecs
 
 
@@ -235,25 +278,104 @@ def _kmeans(X: np.ndarray) -> np.ndarray:
     return best[1]
 
 
+def _agglomerative_sampled(X: np.ndarray) -> tuple[str, float, np.ndarray]:
+    """Memory-bounded agglomerative for corpora above O2_METHOD_CAP.
+
+    The linkage tree (pdist + average linkage) is O(n^2) memory, so it runs on
+    a deterministic subsample; every other doc is then assigned to the cluster
+    whose centroid it is closest to, ONLY when that distance is within the
+    winning threshold. Coherence over coverage is preserved: a doc near no
+    cluster stays an orphan, exactly like in-sample noise.
+
+    Returns (method, threshold, full-length labels) where labels use -1 for
+    orphans, same convention as the HDBSCAN paths.
+    """
+    from scipy.cluster.hierarchy import fcluster, linkage
+    from scipy.spatial.distance import pdist
+
+    rng = np.random.default_rng(42)
+    sample_idx = np.sort(rng.choice(len(X), size=O2_METHOD_CAP, replace=False))
+    Xs = X[sample_idx]
+
+    D = pdist(Xs, metric="euclidean")
+    Z = linkage(D, method="average")
+    best: tuple[int, float, np.ndarray] | None = None  # (dist-to-range, t, labels)
+    for t in DIST_THRESHOLDS:
+        labels_s = fcluster(Z, t=t, criterion="distance") - 1  # 0-based
+        n = _clusters_in_range(labels_s)
+        print(f"  sampled agglomerative threshold {t}: {n} clusters in range")
+        if MIN_CLUSTERS <= n <= MAX_CLUSTERS:
+            best = (0, t, labels_s)
+            break
+        dist = min(abs(n - MIN_CLUSTERS), abs(n - MAX_CLUSTERS))
+        if best is None or dist < best[0]:
+            best = (dist, t, labels_s)
+    assert best is not None
+    _, t, labels_s = best
+
+    # centroids from the in-range sample clusters (unit vectors -> renormalize)
+    live = sorted(set(int(l) for l in labels_s if l >= 0))
+    centroids = np.stack([Xs[labels_s == c].mean(axis=0) for c in live])
+    centroids /= np.maximum(np.linalg.norm(centroids, axis=1, keepdims=True), 1e-12)
+    cid_by_row = np.array(live)
+
+    labels = np.full(len(X), -1, dtype=np.int64)
+    for row, i in enumerate(sample_idx):
+        labels[i] = labels_s[row]
+
+    # threshold-gated centroid assignment for every doc still unclustered
+    # (out-of-sample + sample noise), chunked. Unit vectors: euclid^2 = 2 - 2*cos,
+    # so the distance block is a small (chunk x k) matmul, never n x k x dim.
+    outside = np.flatnonzero(labels == -1)
+    assigned = 0
+    for s in range(0, len(outside), 20_000):
+        chunk = outside[s : s + 20_000]
+        d2 = 2.0 - 2.0 * (X[chunk] @ centroids.T)
+        np.maximum(d2, 0.0, out=d2)
+        dmat = np.sqrt(d2)
+        nearest = np.argmin(dmat, axis=1)
+        within = dmat[np.arange(len(chunk)), nearest] <= t
+        labels[chunk[within]] = cid_by_row[nearest[within]]
+        assigned += int(within.sum())
+    print(
+        f"  centroid assignment: {assigned}/{len(outside)} unclustered docs "
+        f"joined a cluster at threshold {t} (rest are orphans)"
+    )
+
+    return (
+        f"AgglomerativeClustering (average linkage, {O2_METHOD_CAP}-doc sample, "
+        f"unit-normalized, distance_threshold={t}, centroid-assigned remainder)",
+        t,
+        labels,
+    )
+
+
 def cluster_docs(X: np.ndarray) -> tuple[str, float, np.ndarray]:
     """Try the method chain in spec order; return (method, param, labels)."""
     labels = _try_hdbscan(X, pkg=True)
     if labels is not None:
         return "HDBSCAN (hdbscan package)", float(HDBSCAN_MIN_CLUSTER), labels
 
-    labels = _try_hdbscan(X, pkg=False)
-    if labels is not None:
-        return "HDBSCAN (sklearn)", float(HDBSCAN_MIN_CLUSTER), labels
+    # O(n^2)-memory methods below: sklearn HDBSCAN builds the brute-force
+    # pairwise reachability and _agglomerative materializes an n^2/2 condensed
+    # distance matrix. Above O2_METHOD_CAP both are a guaranteed jetsam kill
+    # (2026-10-15..19 nightly deaths), so route to the sampled variant.
+    if len(X) <= O2_METHOD_CAP:
+        labels = _try_hdbscan(X, pkg=False)
+        if labels is not None:
+            return "HDBSCAN (sklearn)", float(HDBSCAN_MIN_CLUSTER), labels
 
-    labels, t = _agglomerative(X)
-    n = _clusters_in_range(labels)
-    if MIN_CLUSTERS <= n <= MAX_CLUSTERS:
-        return (
-            "AgglomerativeClustering (average linkage, unit-normalized, "
-            f"distance_threshold={t})",
-            t,
-            labels,
-        )
+        labels, t = _agglomerative(X)
+        n = _clusters_in_range(labels)
+        if MIN_CLUSTERS <= n <= MAX_CLUSTERS:
+            return (
+                "AgglomerativeClustering (average linkage, unit-normalized, "
+                f"distance_threshold={t})",
+                t,
+                labels,
+            )
+    else:
+        return _agglomerative_sampled(X)
 
     return "MiniBatchKMeans (silhouette-chosen k)", 0.0, _kmeans(X)
 
@@ -369,6 +491,20 @@ def _hub_body(label: str, docs: list[dict], member_idx: list[int]) -> str:
 def build() -> dict:
     print("loading docs and doc vectors ...")
     docs = _load_docs()
+    # Deliberate exclusion (triage kb-embed-464-stuck-vectors, 2026-10-22):
+    # ~467 docs (empty confluence pages, 0-byte github files, stub blog posts)
+    # have NO first chunk at all — no chunk_ord=0 row exists, so there is no
+    # chunks_vec row to acquire or persist. They re-embedded their context
+    # header alone EVERY night (the perpetual "re-embedding 464 docs" line)
+    # and could never converge by construction. Excluded from clustering:
+    # header-only vectors are noise for hdbscan, and hub membership of an
+    # empty document is meaningless.
+    n_zero_chunk = sum(1 for d in docs if not d["chunk"])
+    if n_zero_chunk:
+        print(f"  excluding {n_zero_chunk} zero-chunk docs from clustering "
+              "(no first chunk exists to embed or persist — deliberate, "
+              "kb-embed-464-stuck-vectors 2026-10-22)", flush=True)
+        docs = [d for d in docs if d["chunk"]]
     X = _doc_vectors(docs)
     X = X / np.maximum(np.linalg.norm(X, axis=1, keepdims=True), 1e-12)
 
