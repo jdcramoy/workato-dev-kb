@@ -25,6 +25,7 @@ from .common import (
     save_manifest,
     sha256_text,
 )
+from .wp_source import html_to_markdown
 
 LLMS_URL = "https://docs.workato.com/llms.txt"
 SOURCE = "docs"
@@ -139,15 +140,74 @@ def sync() -> dict:
                 subsection=e.subsection,
             )
 
+    # Mirror-withdrawn guard (2026-10-26 docs drop): a URL still in the
+    # manifest but gone from the TOC is only a true deletion when BOTH the
+    # .md mirror and the plain HTML page are gone. A live HTML page is
+    # fetched and converted to markdown in place, so the doc keeps
+    # refreshing instead of freezing at its last mirror copy.
+    toc_urls = {e.url for e in entries}
+    removed: list[str] = []
+    html_fallback: list[str] = []
+    mirror_revived: list[str] = []
+    for url in sorted(set(manifest) - toc_urls):
+        rec = manifest[url]
+        path = local_path_for(url)
+        body_file = corpus_dir(SOURCE) / path.removeprefix("docs/")
+        md = fetch_cached(url)
+        if md.status == 200:
+            # mirror is serving again (TOC lag): refresh like a normal fetch
+            body_file.parent.mkdir(parents=True, exist_ok=True)
+            body_file.write_text(md.text)
+            rec.update(
+                {
+                    "url": url,
+                    "path": path,
+                    "etag": md.etag,
+                    "sha256": sha256_text(md.text),
+                    "mirror": "ok",
+                }
+            )
+            mirror_revived.append(url)
+            changed += 1
+            continue
+        html_url = url[:-3] if url.endswith(".md") else url
+        html = fetch_cached(html_url, rec.get("html_etag", ""))
+        if html.status == 200:
+            body_md = html_to_markdown(html.text)
+            body_file.parent.mkdir(parents=True, exist_ok=True)
+            body_file.write_text(body_md)
+            rec.update(
+                {
+                    "url": url,
+                    "path": path,
+                    "html_etag": html.etag,
+                    "sha256": sha256_text(body_md),
+                    "mirror": "withdrawn",
+                    "html_url": html_url,
+                }
+            )
+            html_fallback.append(url)
+            changed += 1
+        elif html.status == 304:
+            # mirror still withdrawn, HTML unchanged since last fallback fetch
+            rec.update({"mirror": "withdrawn", "html_url": html_url})
+            unchanged += 1
+        else:
+            # .md mirror gone AND HTML page gone: a true upstream deletion
+            # (e.g. data-pipeline-recipe). Reported as removed; the corpus
+            # keeps the last fetched copy (deletes stay manual).
+            removed.append(url)
+
     save_manifest(SOURCE, manifest)
 
-    removed = sorted(set(manifest) - {e.url for e in entries})
     summary = {
         "source": SOURCE,
         "toc_entries": len(entries),
         "changed": changed,
         "unchanged": unchanged,
         "removed": removed,
+        "html_fallback": html_fallback,
+        "mirror_revived": mirror_revived,
         "errors": errors,
     }
     return summary
