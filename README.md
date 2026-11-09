@@ -26,7 +26,7 @@ first search works. It is safe to re-run at any point.
 ```
 
 `--with-corpus` also installs the team knowledge corpus
-([Workato-All/knowledge-corpus](https://github.com/jdcramoy/knowledge-corpus),
+([jdcramoy/knowledge-corpus](https://github.com/jdcramoy/knowledge-corpus),
 the sanitized team-shared knowledge tree) into `~/.claude/knowledge`, where
 the fractal layer indexes it — so the memory layer answers from real build
 doctrine, not just the scaffold. An existing knowledge tree is never
