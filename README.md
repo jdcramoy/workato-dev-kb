@@ -9,7 +9,7 @@ generic-form playbooks and trap catalogs — all over public Workato sources.
 ## Quickstart
 
 ```bash
-git clone git@github.com:Workato-All/workato-dev-kb.git && cd workato-dev-kb
+git clone git@github.com/jdcramoy/workato-dev-kb.git && cd workato-dev-kb
 ./install.sh
 kb "how do I handle pagination in a custom connector"
 ```
@@ -26,7 +26,7 @@ first search works. It is safe to re-run at any point.
 ```
 
 `--with-corpus` also installs the team knowledge corpus
-([Workato-All/knowledge-corpus](https://github.com/Workato-All/knowledge-corpus),
+([Workato-All/knowledge-corpus](https://github.com/jdcramoy/knowledge-corpus),
 the sanitized team-shared knowledge tree) into `~/.claude/knowledge`, where
 the fractal layer indexes it — so the memory layer answers from real build
 doctrine, not just the scaffold. An existing knowledge tree is never
